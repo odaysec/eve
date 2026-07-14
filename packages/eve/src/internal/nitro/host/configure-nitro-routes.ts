@@ -357,8 +357,7 @@ async function registerWorkflowRoute(
 
 /**
  * Wires eve's package-owned app, channel, workflow inspection, dev-control,
- * and Workflow SDK endpoints into the watch-mode Nitro host, rebuilding
- * workflow bundles on reload.
+ * and Workflow SDK endpoints into one development Nitro candidate.
  */
 export async function configureDevelopmentNitroRoutes(
   nitro: Nitro,
@@ -373,8 +372,6 @@ export async function configureDevelopmentNitroRoutes(
     rootDir: resolvePackageRoot(),
     watch: true,
   });
-  // Overlapping `build:before` and `dev:reload` syncs are serialized by
-  // `builder.build`'s per-output-directory queue.
   const syncWorkflowArtifacts = async () => {
     await builder.build({
       nitroStepOutfile: join(workflowBuildDirectory, "steps.mjs"),
@@ -383,7 +380,6 @@ export async function configureDevelopmentNitroRoutes(
   };
 
   await registerWorkflowArtifactBuildHook(nitro, syncWorkflowArtifacts);
-  nitro.hooks.hook("dev:reload", syncWorkflowArtifacts);
 
   const artifactsConfig = createDevelopmentNitroArtifactsConfig({
     appRoot: preparedHost.appRoot,

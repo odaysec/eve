@@ -4,6 +4,7 @@ import type { ResolvedScheduleDefinition } from "#runtime/types.js";
 import type { GeneratedCompiledArtifactsFiles } from "#internal/application/compiled-artifacts.js";
 import type { DevBootProgressReporter } from "#internal/dev-boot-progress.js";
 import type { DevelopmentGeneration } from "#internal/nitro/development-generation.js";
+import type { DevelopmentHostWorkspace } from "#internal/nitro/host/dev-host-workspace.js";
 
 /**
  * Route surface included in one programmatic Nitro host build.
@@ -74,4 +75,5 @@ export interface PreparedApplicationHost {
 
 export interface PreparedDevelopmentApplicationHost extends PreparedApplicationHost {
   generation: DevelopmentGeneration;
+  workspace: DevelopmentHostWorkspace;
 }

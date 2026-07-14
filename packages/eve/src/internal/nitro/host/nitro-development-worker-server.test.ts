@@ -8,6 +8,8 @@ const mocks = vi.hoisted(() => ({
     listen: vi.fn(),
     prepareCandidate: vi.fn(),
     promote: vi.fn(async () => undefined),
+    publishRuntimeGeneration: vi.fn(async () => undefined),
+    publishStructuralCandidate: vi.fn(async () => undefined),
     setControlHandler: vi.fn(),
   },
 }));
@@ -48,6 +50,7 @@ describe("NitroDevelopmentWorkerServer", () => {
     mocks.core.prepareCandidate.mockReturnValueOnce(candidateReady.promise);
     const hook = ((name: string, handler: (...args: never[]) => unknown) => {
       hooks.set(name, handler);
+      return () => hooks.delete(name);
     }) as Nitro["hooks"]["hook"];
     const nitro = {
       hooks: {
@@ -60,11 +63,13 @@ describe("NitroDevelopmentWorkerServer", () => {
     };
     const { NitroDevelopmentWorkerServer } =
       await import("#internal/nitro/host/nitro-development-worker-server.js");
-    const server = new NitroDevelopmentWorkerServer({ appRoot: "/tmp/app", nitro });
+    const server = new NitroDevelopmentWorkerServer({ appRoot: "/tmp/app" });
     const buildError = new Error("Nitro build failed");
 
     const result = server.buildCandidate({
+      dispose: async () => undefined,
       generation: { id: "generation-a", runtimeAppRoot: "/tmp/generation-a" },
+      nitro,
       trigger: async () => {
         const reload = hooks.get("dev:reload")?.({
           entry: "/tmp/index.mjs",
@@ -78,5 +83,39 @@ describe("NitroDevelopmentWorkerServer", () => {
 
     await expect(result).rejects.toThrow("Nitro build failed");
     expect(mocks.core.discardCandidate).toHaveBeenCalledWith(candidate);
+  });
+
+  it("reports both a Nitro failure and failed candidate cleanup", async () => {
+    const hooks = new Map<string, (...args: never[]) => unknown>();
+    const hook = ((name: string, handler: (...args: never[]) => unknown) => {
+      hooks.set(name, handler);
+      return () => hooks.delete(name);
+    }) as Nitro["hooks"]["hook"];
+    const nitro = {
+      hooks: { hook },
+      options: {
+        output: { dir: "/tmp/nitro", serverDir: "server" },
+      },
+    };
+    const { NitroDevelopmentWorkerServer } =
+      await import("#internal/nitro/host/nitro-development-worker-server.js");
+    const server = new NitroDevelopmentWorkerServer({ appRoot: "/tmp/app" });
+    const buildError = new Error("Nitro build failed");
+    const cleanupError = new Error("candidate cleanup failed");
+
+    const result = server.buildCandidate({
+      dispose: async () => {
+        throw cleanupError;
+      },
+      generation: { id: "generation-a", runtimeAppRoot: "/tmp/generation-a" },
+      nitro,
+      trigger: async () => {
+        throw buildError;
+      },
+    });
+
+    const error = await result.catch((cause: unknown) => cause);
+    expect(error).toBeInstanceOf(AggregateError);
+    expect((error as AggregateError).errors).toEqual([buildError, cleanupError]);
   });
 });

@@ -155,6 +155,28 @@ async function withinDeadline<T>(operation: Promise<T>, message: string): Promis
 }
 
 describe("development worker server", () => {
+  it("disposes a candidate host when worker creation fails", async () => {
+    const dispose = vi.fn(async () => undefined);
+    const server = createDevelopmentWorkerServer({
+      appRoot: "/tmp/eve-dev-worker-test",
+      createRunner: () => {
+        throw new Error("worker creation failed");
+      },
+      resolveAdmissionGeneration: (generation) => generation,
+    });
+
+    await expect(
+      server.prepareCandidate({
+        dispose,
+        entry: "/tmp/failed.mjs",
+        generation: FIRST_GENERATION,
+        workerData: {},
+      }),
+    ).rejects.toThrow("worker creation failed");
+    expect(dispose).toHaveBeenCalledOnce();
+    await closeWithinDeadline(() => server.close());
+  });
+
   it("keeps the active worker while a candidate is unready or fails readiness", async () => {
     const candidateReadiness = createDeferred<void>();
     const { createRunner, runners } = createRunnerFactory(
@@ -167,6 +189,7 @@ describe("development worker server", () => {
     );
     const { server, url } = await listen(createRunner);
     const first = await server.prepareCandidate({
+      dispose: async () => undefined,
       entry: "/tmp/first.mjs",
       generation: FIRST_GENERATION,
       workerData: {},
@@ -178,6 +201,7 @@ describe("development worker server", () => {
     });
 
     const pendingCandidate = server.prepareCandidate({
+      dispose: async () => undefined,
       entry: "/tmp/second.mjs",
       generation: SECOND_GENERATION,
       workerData: {},
@@ -212,6 +236,7 @@ describe("development worker server", () => {
     });
     const { server, url } = await listen(createRunner);
     const first = await server.prepareCandidate({
+      dispose: async () => undefined,
       entry: "/tmp/first.mjs",
       generation: FIRST_GENERATION,
       workerData: {},
@@ -242,6 +267,7 @@ describe("development worker server", () => {
       () => admissionGeneration,
     );
     const candidate = await server.prepareCandidate({
+      dispose: async () => undefined,
       entry: "/tmp/first.mjs",
       generation: FIRST_GENERATION,
       workerData: {},
@@ -275,6 +301,7 @@ describe("development worker server", () => {
     );
     const { server, url } = await listen(createRunner);
     const candidate = await server.prepareCandidate({
+      dispose: async () => undefined,
       entry: "/tmp/stream.mjs",
       generation: FIRST_GENERATION,
       workerData: {},
@@ -318,6 +345,7 @@ describe("development worker server", () => {
     });
     const { server, url } = await listen(createRunner);
     const first = await server.prepareCandidate({
+      dispose: async () => undefined,
       entry: "/tmp/first.mjs",
       generation: FIRST_GENERATION,
       workerData: {},
@@ -327,6 +355,7 @@ describe("development worker server", () => {
     const response = await fetch(url);
     await firstChunk.promise;
     const second = await server.prepareCandidate({
+      dispose: async () => undefined,
       entry: "/tmp/second.mjs",
       generation: SECOND_GENERATION,
       workerData: {},
@@ -359,6 +388,7 @@ describe("development worker server", () => {
     });
     const { server, url } = await listen(createRunner);
     const first = await server.prepareCandidate({
+      dispose: async () => undefined,
       entry: "/tmp/first.mjs",
       generation: FIRST_GENERATION,
       workerData: {},
@@ -377,6 +407,7 @@ describe("development worker server", () => {
     request.write("partial body");
     await bodyStarted.promise;
     const second = await server.prepareCandidate({
+      dispose: async () => undefined,
       entry: "/tmp/second.mjs",
       generation: SECOND_GENERATION,
       workerData: {},
@@ -402,6 +433,7 @@ describe("development worker server", () => {
     );
     const { server, url } = await listen(createRunner);
     const first = await server.prepareCandidate({
+      dispose: async () => undefined,
       entry: "/tmp/first.mjs",
       generation: FIRST_GENERATION,
       workerData: {},
@@ -412,6 +444,7 @@ describe("development worker server", () => {
     try {
       const firstResponse = await requestWithAgent(url, agent);
       const second = await server.prepareCandidate({
+        dispose: async () => undefined,
         entry: "/tmp/second.mjs",
         generation: SECOND_GENERATION,
         workerData: {},
@@ -426,6 +459,92 @@ describe("development worker server", () => {
       agent.destroy();
       await closeWithinDeadline(() => server.close());
     }
+  });
+
+  it("keeps the active worker when structural publication fails", async () => {
+    const { createRunner, runners } = createRunnerFactory(
+      async (_request, runnerIndex) => new Response(runnerIndex === 0 ? "active" : "candidate"),
+    );
+    const { server, url } = await listen(createRunner);
+    const active = await server.prepareCandidate({
+      dispose: async () => undefined,
+      entry: "/tmp/first.mjs",
+      generation: FIRST_GENERATION,
+      workerData: {},
+    });
+    await server.promote(active);
+    const candidateDispose = vi.fn(async () => undefined);
+    const candidate = await server.prepareCandidate({
+      dispose: candidateDispose,
+      entry: "/tmp/second.mjs",
+      generation: SECOND_GENERATION,
+      workerData: {},
+    });
+
+    await expect(
+      server.publishStructuralCandidate({
+        candidate,
+        publish: async () => {
+          throw new Error("pointer publication failed");
+        },
+      }),
+    ).rejects.toThrow("pointer publication failed");
+    await server.discardCandidate(candidate);
+
+    await expect(fetch(url).then(async (response) => await response.text())).resolves.toBe(
+      "active",
+    );
+    expect(runners[0]?.closeMock).not.toHaveBeenCalled();
+    expect(runners[1]?.closeMock).toHaveBeenCalledOnce();
+    expect(candidateDispose).toHaveBeenCalledOnce();
+
+    await closeWithinDeadline(() => server.close());
+  });
+
+  it("rolls back publication before admitting requests when a candidate closes", async () => {
+    const { createRunner, runners } = createRunnerFactory(
+      async (_request, runnerIndex) => new Response(runnerIndex === 0 ? "active" : "candidate"),
+    );
+    const { server, url } = await listen(createRunner);
+    const active = await server.prepareCandidate({
+      dispose: async () => undefined,
+      entry: "/tmp/first.mjs",
+      generation: FIRST_GENERATION,
+      workerData: {},
+    });
+    await server.promote(active);
+    const candidate = await server.prepareCandidate({
+      dispose: async () => undefined,
+      entry: "/tmp/second.mjs",
+      generation: SECOND_GENERATION,
+      workerData: {},
+    });
+    const rollbackAllowed = createDeferred<void>();
+    const rollback = vi.fn(async () => await rollbackAllowed.promise);
+
+    const promotion = server.publishStructuralCandidate({
+      candidate,
+      publish: async () => {
+        runners[1]?.crash(new Error("candidate closed during publication"));
+        return { commit: vi.fn(), rollback };
+      },
+    });
+    await vi.waitFor(() => expect(rollback).toHaveBeenCalledOnce());
+    let requestSettled = false;
+    const request = fetch(url)
+      .then(async (response) => await response.text())
+      .finally(() => {
+        requestSettled = true;
+      });
+    await Promise.resolve();
+    expect(requestSettled).toBe(false);
+
+    rollbackAllowed.resolve();
+    await expect(promotion).rejects.toThrow("not ready for promotion");
+    await expect(request).resolves.toBe("active");
+    await server.discardCandidate(candidate);
+
+    await closeWithinDeadline(() => server.close());
   });
 
   it("holds a websocket lease until close and stamps the parent socket address", async () => {
@@ -448,6 +567,7 @@ describe("development worker server", () => {
     );
     const { server, url } = await listen(createRunner);
     const first = await server.prepareCandidate({
+      dispose: async () => undefined,
       entry: "/tmp/first.mjs",
       generation: FIRST_GENERATION,
       workerData: {},
@@ -469,6 +589,7 @@ describe("development worker server", () => {
     );
     await upgraded.promise;
     const second = await server.prepareCandidate({
+      dispose: async () => undefined,
       entry: "/tmp/second.mjs",
       generation: SECOND_GENERATION,
       workerData: {},
@@ -501,6 +622,7 @@ describe("development worker server", () => {
     );
     const { server, url } = await listen(createRunner);
     const candidate = await server.prepareCandidate({
+      dispose: async () => undefined,
       entry: "/tmp/stream.mjs",
       generation: FIRST_GENERATION,
       workerData: {},
@@ -530,6 +652,7 @@ describe("development worker server", () => {
     });
     const { server, url } = await listen(createRunner);
     const candidate = await server.prepareCandidate({
+      dispose: async () => undefined,
       entry: "/tmp/metadata.mjs",
       generation: FIRST_GENERATION,
       workerData: {},
@@ -567,6 +690,7 @@ describe("development worker server", () => {
     const { createRunner, runners } = createRunnerFactory(async () => new Response("ok"));
     const { server } = await listen(createRunner);
     const candidate = await server.prepareCandidate({
+      dispose: async () => undefined,
       entry: "/tmp/close.mjs",
       generation: FIRST_GENERATION,
       workerData: {},

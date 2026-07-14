@@ -24,13 +24,20 @@ const mocks = vi.hoisted(() => {
     url: "http://localhost:2000/",
   };
   const devServer = {
-    buildCandidate: vi.fn(async (input: { trigger: () => Promise<void> }) => {
-      await input.trigger();
-      return {};
-    }),
     close: vi.fn(async () => undefined),
+    discardCandidate: vi.fn(async () => undefined),
     listen: vi.fn(() => listenerServer),
     promote: vi.fn(async () => undefined),
+    publishRuntimeGeneration: vi.fn(async (publish: () => Promise<{ commit(): void }>) => {
+      const publication = await publish();
+      publication.commit();
+    }),
+    publishStructuralCandidate: vi.fn(
+      async (input: { publish: () => Promise<{ commit(): void }> }) => {
+        const publication = await input.publish();
+        publication.commit();
+      },
+    ),
     setControlHandler: vi.fn(),
   };
   const files = new Map<string, string>();
@@ -51,7 +58,17 @@ const mocks = vi.hoisted(() => {
 
   return {
     authoredSourceWatcher,
-    buildNitro: vi.fn(async () => undefined),
+    activateDevelopmentGenerationTransaction: vi.fn(async () => ({
+      commit: vi.fn(),
+      rollback: vi.fn(async () => undefined),
+    })),
+    buildDevelopmentHostCandidate: vi.fn(async (input: { nitro: { close(): Promise<void> } }) => {
+      await input.nitro.close();
+      return {};
+    }),
+    createDevelopmentAuthoredRebuildCoordinator: vi.fn(async () => ({
+      rebuild: vi.fn(),
+    })),
     createDevelopmentApplicationNitro: vi.fn(async () => nitro),
     devServer,
     fetch: vi.fn(async () => new Response(null, { status: 200 })),
@@ -69,8 +86,17 @@ const mocks = vi.hoisted(() => {
         snapshotSourceRoot: "/tmp/eve-test/.eve/dev-runtime/snapshots/test/source",
         sourceRoot: "/tmp/eve-test",
       },
+      workspace: {
+        artifactsDir: "/tmp/eve-test/.eve/dev-hosts/test/artifacts",
+        compilerArtifactsDir: "/tmp/eve-test/.eve/dev-hosts/test/compiler",
+        nitroBuildDir: "/tmp/eve-test/.eve/dev-hosts/test/nitro",
+        nitroOutputDir: "/tmp/eve-test/.eve/dev-hosts/test/output",
+        rootDir: "/tmp/eve-test/.eve/dev-hosts/test",
+        workflowBuildDir: "/tmp/eve-test/.eve/dev-hosts/test/workflow",
+      },
     })),
-    prepareNitro: vi.fn(async () => undefined),
+    discardDevelopmentGeneration: vi.fn(async () => undefined),
+    removeDevelopmentHostWorkspace: vi.fn(async () => undefined),
     readFile: vi.fn(async (path: string) => {
       if (
         path.endsWith("/.eve/dev-server-state.v1.json") &&
@@ -123,16 +149,27 @@ vi.mock("node:fs/promises", () => ({
   writeFile: mocks.writeFile,
 }));
 
-vi.mock("nitro/builder", () => ({
-  build: mocks.buildNitro,
-  prepare: mocks.prepareNitro,
-}));
-
 vi.mock("./nitro-development-worker-server.js", () => ({
   NitroDevelopmentWorkerServer: function NitroDevelopmentWorkerServer() {
     return mocks.devServer;
   },
-  toDevelopmentWorkerGeneration: vi.fn((generation) => generation),
+}));
+
+vi.mock("./dev-host-candidate.js", () => ({
+  buildDevelopmentHostCandidate: mocks.buildDevelopmentHostCandidate,
+}));
+
+vi.mock("./dev-authored-rebuild-coordinator.js", () => ({
+  createDevelopmentAuthoredRebuildCoordinator: mocks.createDevelopmentAuthoredRebuildCoordinator,
+}));
+
+vi.mock("./dev-host-workspace.js", () => ({
+  removeDevelopmentHostWorkspace: mocks.removeDevelopmentHostWorkspace,
+}));
+
+vi.mock("#internal/nitro/development-generation.js", () => ({
+  activateDevelopmentGenerationTransaction: mocks.activateDevelopmentGenerationTransaction,
+  discardDevelopmentGeneration: mocks.discardDevelopmentGeneration,
 }));
 
 vi.mock("./create-application-nitro.js", () => ({

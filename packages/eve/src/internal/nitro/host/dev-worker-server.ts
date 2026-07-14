@@ -49,6 +49,8 @@ export type DevelopmentWorkerRunnerFactory = (
 type WorkerState = "candidate" | "active" | "retired" | "closed";
 
 interface WorkerSlot {
+  disposed: boolean;
+  readonly dispose: () => Promise<void>;
   readonly entry: string;
   readonly generation: DevelopmentWorkerGeneration;
   leases: number;
@@ -59,6 +61,11 @@ interface WorkerSlot {
 
 export interface DevelopmentWorkerCandidate {
   readonly slot: WorkerSlot;
+}
+
+export interface DevelopmentWorkerPublication {
+  commit(): void;
+  rollback(): Promise<void>;
 }
 
 export interface DevelopmentWorkerListener {
@@ -89,11 +96,17 @@ export interface DevelopmentWorkerServer {
   discardCandidate(candidate: DevelopmentWorkerCandidate): Promise<void>;
   listen(input: { readonly hostname: string; readonly port: number }): DevelopmentWorkerListener;
   prepareCandidate(input: {
+    readonly dispose: () => Promise<void>;
     readonly entry: string;
     readonly generation: DevelopmentWorkerGeneration;
     readonly workerData: Readonly<Record<string, unknown>>;
   }): Promise<DevelopmentWorkerCandidate>;
   promote(candidate: DevelopmentWorkerCandidate): Promise<void>;
+  publishRuntimeGeneration(publish: () => Promise<DevelopmentWorkerPublication>): Promise<void>;
+  publishStructuralCandidate(input: {
+    readonly candidate: DevelopmentWorkerCandidate;
+    readonly publish: () => Promise<DevelopmentWorkerPublication>;
+  }): Promise<void>;
   setControlHandler(handler: (request: Request) => Promise<Response | undefined>): void;
 }
 
@@ -209,6 +222,7 @@ class ParentDevelopmentWorkerServer implements DevelopmentWorkerServer {
   }
 
   async prepareCandidate(input: {
+    readonly dispose: () => Promise<void>;
     readonly entry: string;
     readonly generation: DevelopmentWorkerGeneration;
     readonly workerData: Readonly<Record<string, unknown>>;
@@ -219,19 +233,35 @@ class ParentDevelopmentWorkerServer implements DevelopmentWorkerServer {
 
     let slot: WorkerSlot | undefined;
     const workerNumber = this.#workerCounter++;
-    const runner = this.#createRunner({
-      appRoot: this.#appRoot,
-      entry: input.entry,
-      name: `eve-dev-${String(workerNumber)}`,
-      onClose: (cause) => {
-        if (slot !== undefined) {
-          void this.#handleWorkerClose(slot, cause);
-        }
-      },
-      transportSecret: this.#transportSecret,
-      workerData: input.workerData,
-    });
+    let runner: DevelopmentWorkerRunner;
+    try {
+      runner = this.#createRunner({
+        appRoot: this.#appRoot,
+        entry: input.entry,
+        name: `eve-dev-${String(workerNumber)}`,
+        onClose: (cause) => {
+          if (slot !== undefined) {
+            void this.#handleWorkerClose(slot, cause);
+          }
+        },
+        transportSecret: this.#transportSecret,
+        workerData: input.workerData,
+      });
+    } catch (error) {
+      try {
+        await input.dispose();
+      } catch (disposeError) {
+        throw new AggregateError(
+          [error, disposeError],
+          "Development worker creation and host cleanup failed.",
+          { cause: error },
+        );
+      }
+      throw error;
+    }
     slot = {
+      dispose: input.dispose,
+      disposed: false,
       entry: input.entry,
       generation: input.generation,
       leases: 0,
@@ -257,6 +287,47 @@ class ParentDevelopmentWorkerServer implements DevelopmentWorkerServer {
   }
 
   async promote(candidate: DevelopmentWorkerCandidate): Promise<void> {
+    const previousSlot = await this.#gateAdmission(async () => this.#swapCandidate(candidate));
+    await this.#closeRetiredSlotWithoutFailingCommit(previousSlot);
+  }
+
+  async publishRuntimeGeneration(
+    publish: () => Promise<DevelopmentWorkerPublication>,
+  ): Promise<void> {
+    await this.#gateAdmission(async () => {
+      const publication = await publish();
+      publication.commit();
+    });
+  }
+
+  async publishStructuralCandidate(input: {
+    readonly candidate: DevelopmentWorkerCandidate;
+    readonly publish: () => Promise<DevelopmentWorkerPublication>;
+  }): Promise<void> {
+    const previousSlot = await this.#gateAdmission(async () => {
+      this.#validateCandidate(input.candidate);
+      const publication = await input.publish();
+      try {
+        const slot = this.#swapCandidate(input.candidate);
+        publication.commit();
+        return slot;
+      } catch (error) {
+        try {
+          await publication.rollback();
+        } catch (rollbackError) {
+          throw new AggregateError(
+            [error, rollbackError],
+            "Development worker publication rollback failed.",
+            { cause: error },
+          );
+        }
+        throw error;
+      }
+    });
+    await this.#closeRetiredSlotWithoutFailingCommit(previousSlot);
+  }
+
+  async #gateAdmission<T>(operation: () => Promise<T>): Promise<T> {
     const previousPromotion = this.#promotion;
     let finishPromotion: (() => void) | undefined;
     this.#promotion = new Promise<void>((resolve) => {
@@ -268,22 +339,30 @@ class ParentDevelopmentWorkerServer implements DevelopmentWorkerServer {
       if (!this.#accepting) {
         throw new Error("Development worker server is closed.");
       }
-      if (candidate.slot.state !== "candidate" || candidate.slot.runner.closed) {
-        throw new Error("Development worker candidate is not ready for promotion.");
-      }
-
-      const previousSlot = this.#activeSlot;
-      candidate.slot.state = "active";
-      this.#activeSlot = candidate.slot;
-      this.#wakeActiveWaiters();
-
-      if (previousSlot !== undefined && previousSlot !== candidate.slot) {
-        previousSlot.state = "retired";
-        await this.#closeRetiredSlot(previousSlot);
-      }
+      return await operation();
     } finally {
       finishPromotion?.();
     }
+  }
+
+  #validateCandidate(candidate: DevelopmentWorkerCandidate): void {
+    if (candidate.slot.state !== "candidate" || candidate.slot.runner.closed) {
+      throw new Error("Development worker candidate is not ready for promotion.");
+    }
+  }
+
+  #swapCandidate(candidate: DevelopmentWorkerCandidate): WorkerSlot | undefined {
+    this.#validateCandidate(candidate);
+    const previousSlot = this.#activeSlot;
+    candidate.slot.state = "active";
+    this.#activeSlot = candidate.slot;
+    this.#wakeActiveWaiters();
+
+    if (previousSlot !== undefined && previousSlot !== candidate.slot) {
+      previousSlot.state = "retired";
+    }
+
+    return previousSlot;
   }
 
   async discardCandidate(candidate: DevelopmentWorkerCandidate): Promise<void> {
@@ -469,7 +548,9 @@ class ParentDevelopmentWorkerServer implements DevelopmentWorkerServer {
     }
 
     try {
+      slot.disposed = true;
       const candidate = await this.prepareCandidate({
+        dispose: slot.dispose,
         entry: slot.entry,
         generation: slot.generation,
         workerData: slot.workerData,
@@ -497,7 +578,33 @@ class ParentDevelopmentWorkerServer implements DevelopmentWorkerServer {
     if (this.#activeSlot === slot) {
       this.#activeSlot = undefined;
     }
-    await slot.runner.close(cause);
+    const cleanup = await Promise.allSettled([slot.runner.close(cause), this.#disposeSlot(slot)]);
+    const errors = cleanup.flatMap((result) =>
+      result.status === "rejected" ? [result.reason] : [],
+    );
+    if (errors.length === 1) {
+      throw errors[0];
+    }
+    if (errors.length > 1) {
+      throw new AggregateError(errors, "Failed to close a development worker and its host.");
+    }
+  }
+
+  async #disposeSlot(slot: WorkerSlot): Promise<void> {
+    if (slot.disposed) {
+      return;
+    }
+    slot.disposed = true;
+    await slot.dispose();
+  }
+
+  async #closeRetiredSlotWithoutFailingCommit(slot: WorkerSlot | undefined): Promise<void> {
+    if (slot === undefined) {
+      return;
+    }
+    await this.#closeRetiredSlot(slot).catch((error) => {
+      console.error(`[eve:dev] failed to close retired worker: ${toErrorMessage(error)}`);
+    });
   }
 
   #wakeActiveWaiters(): void {

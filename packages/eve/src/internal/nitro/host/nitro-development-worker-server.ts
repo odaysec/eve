@@ -8,23 +8,15 @@ import {
   type DevelopmentWorkerCandidate,
   type DevelopmentWorkerGeneration,
   type DevelopmentWorkerListener,
+  type DevelopmentWorkerPublication,
   type DevelopmentWorkerServer,
 } from "#internal/nitro/host/dev-worker-server.js";
 import { createNodeDevelopmentWorkerRunner } from "#internal/nitro/host/dev-worker-runner.js";
-import { toErrorMessage } from "#shared/errors.js";
 
-interface PendingCandidate {
-  readonly generation: DevelopmentWorkerGeneration;
-  readonly promise: Promise<DevelopmentWorkerCandidate>;
-  reject(error: unknown): void;
-  resolve(candidate: DevelopmentWorkerCandidate): void;
-}
+const NITRO_CANDIDATE_BUILD_TIMEOUT_MS = 60_000;
 
-interface NitroDevelopmentWorkerHost {
+interface NitroCandidateHost {
   readonly hooks: Pick<Nitro["hooks"], "hook">;
-  readonly logger: {
-    error(message: unknown, ...details: unknown[]): unknown;
-  };
   readonly options: {
     readonly output: Pick<Nitro["options"]["output"], "dir" | "serverDir">;
   };
@@ -32,13 +24,10 @@ interface NitroDevelopmentWorkerHost {
 
 export class NitroDevelopmentWorkerServer {
   readonly #appRoot: string;
-  readonly #nitro: NitroDevelopmentWorkerHost;
-  #pendingCandidate: PendingCandidate | undefined;
   readonly #server: DevelopmentWorkerServer;
 
-  constructor(input: { readonly appRoot: string; readonly nitro: NitroDevelopmentWorkerHost }) {
+  constructor(input: { readonly appRoot: string }) {
     this.#appRoot = input.appRoot;
-    this.#nitro = input.nitro;
     this.#server = createDevelopmentWorkerServer({
       appRoot: input.appRoot,
       createRunner: createNodeDevelopmentWorkerRunner,
@@ -50,21 +39,6 @@ export class NitroDevelopmentWorkerServer {
         return generation;
       },
     });
-
-    input.nitro.hooks.hook("dev:reload", async (payload) => {
-      await this.#handleReload({
-        entry: payload?.entry ?? this.#resolveDefaultEntry(),
-        workerData: payload?.workerData ?? {},
-      });
-    });
-    input.nitro.hooks.hook("dev:error", (error) => {
-      const pending = this.#pendingCandidate;
-      if (pending !== undefined) {
-        this.#pendingCandidate = undefined;
-        pending.reject(error);
-      }
-    });
-    input.nitro.hooks.hook("close", async () => await this.close());
   }
 
   listen(input: { readonly hostname: string; readonly port: number }): DevelopmentWorkerListener {
@@ -76,93 +50,101 @@ export class NitroDevelopmentWorkerServer {
   }
 
   async buildCandidate(input: {
+    readonly dispose: () => Promise<void>;
     readonly generation: DevelopmentWorkerGeneration;
+    readonly nitro: NitroCandidateHost;
     readonly trigger: () => Promise<void>;
   }): Promise<DevelopmentWorkerCandidate> {
-    if (this.#pendingCandidate !== undefined) {
-      throw new Error("A development worker candidate is already pending.");
-    }
+    let buildError: unknown;
+    let candidatePromise: Promise<DevelopmentWorkerCandidate> | undefined;
+    let disposePromise: Promise<void> | undefined;
+    const candidateSignal = createDeferred();
+    const dispose = () => {
+      disposePromise ??= input.dispose();
+      return disposePromise;
+    };
+    const removeReloadHook = input.nitro.hooks.hook("dev:reload", async (payload) => {
+      if (candidatePromise !== undefined) {
+        const error = new Error("Nitro emitted more than one worker candidate for a single build.");
+        buildError = error;
+        candidateSignal.resolve();
+        return;
+      }
+      candidatePromise = this.#server.prepareCandidate({
+        dispose,
+        entry: payload?.entry ?? resolveDefaultEntry(input.nitro),
+        generation: input.generation,
+        workerData: payload?.workerData ?? {},
+      });
+      try {
+        await candidatePromise;
+      } catch (error) {
+        buildError = error;
+      } finally {
+        candidateSignal.resolve();
+      }
+    });
+    const removeErrorHook = input.nitro.hooks.hook("dev:error", (error) => {
+      buildError = error;
+      candidateSignal.resolve();
+    });
 
-    const pending = createPendingCandidate(input.generation);
-    void pending.promise.catch(() => undefined);
-    this.#pendingCandidate = pending;
     try {
       await input.trigger();
-      return await pending.promise;
-    } catch (error) {
-      if (this.#pendingCandidate === pending) {
-        this.#pendingCandidate = undefined;
-        pending.reject(error);
+      if (buildError !== undefined) {
+        throw buildError;
       }
-      const candidate = await pending.promise.catch(() => undefined);
-      if (candidate !== undefined) {
-        await this.#server.discardCandidate(candidate);
+      await waitForCandidateSignal(candidateSignal.promise);
+      if (buildError !== undefined) {
+        throw buildError;
+      }
+      if (candidatePromise === undefined) {
+        throw new Error("Nitro did not emit a development worker candidate.");
+      }
+      return await candidatePromise;
+    } catch (error) {
+      const cleanupError = await cleanupFailedCandidate({
+        candidatePromise,
+        discardCandidate: async (candidate) => await this.#server.discardCandidate(candidate),
+        dispose,
+      });
+      if (cleanupError !== undefined && cleanupError !== error) {
+        throw new AggregateError(
+          [error, cleanupError],
+          "Development candidate build and cleanup failed.",
+          { cause: error },
+        );
       }
       throw error;
+    } finally {
+      removeReloadHook();
+      removeErrorHook();
     }
+  }
+
+  async discardCandidate(candidate: DevelopmentWorkerCandidate): Promise<void> {
+    await this.#server.discardCandidate(candidate);
   }
 
   async promote(candidate: DevelopmentWorkerCandidate): Promise<void> {
     await this.#server.promote(candidate);
   }
 
-  async close(): Promise<void> {
-    const pending = this.#pendingCandidate;
-    if (pending !== undefined) {
-      this.#pendingCandidate = undefined;
-      pending.reject(new Error("Development worker server closed."));
-    }
-    await this.#server.close();
+  async publishRuntimeGeneration(
+    publish: () => Promise<DevelopmentWorkerPublication>,
+  ): Promise<void> {
+    await this.#server.publishRuntimeGeneration(publish);
   }
 
-  async #handleReload(input: {
-    readonly entry: string;
-    readonly workerData: Readonly<Record<string, unknown>>;
+  async publishStructuralCandidate(input: {
+    readonly candidate: DevelopmentWorkerCandidate;
+    readonly publish: () => Promise<DevelopmentWorkerPublication>;
   }): Promise<void> {
-    const pending = this.#pendingCandidate;
-    const generation = pending?.generation ?? readActiveGeneration(this.#appRoot);
-    if (generation === undefined) {
-      const error = new Error("Nitro produced a worker without an active development generation.");
-      if (pending !== undefined) {
-        this.#pendingCandidate = undefined;
-        pending.reject(error);
-        return;
-      }
-      throw error;
-    }
-
-    try {
-      const candidate = await this.#server.prepareCandidate({
-        entry: input.entry,
-        generation,
-        workerData: input.workerData,
-      });
-      if (pending !== undefined && this.#pendingCandidate === pending) {
-        this.#pendingCandidate = undefined;
-        pending.resolve(candidate);
-        return;
-      }
-      if (pending !== undefined) {
-        await this.#server.discardCandidate(candidate);
-        return;
-      }
-      await this.#server.promote(candidate);
-    } catch (error) {
-      if (pending !== undefined && this.#pendingCandidate === pending) {
-        this.#pendingCandidate = undefined;
-        pending.reject(error);
-        return;
-      }
-      this.#nitro.logger.error(`[eve:dev] candidate worker failed: ${toErrorMessage(error)}`);
-    }
+    await this.#server.publishStructuralCandidate(input);
   }
 
-  #resolveDefaultEntry(): string {
-    return resolve(
-      this.#nitro.options.output.dir,
-      this.#nitro.options.output.serverDir,
-      "index.mjs",
-    );
+  async close(): Promise<void> {
+    await this.#server.close();
   }
 }
 
@@ -184,22 +166,69 @@ function readActiveGeneration(appRoot: string): DevelopmentWorkerGeneration | un
   return toDevelopmentWorkerGeneration(snapshot);
 }
 
-function createPendingCandidate(generation: DevelopmentWorkerGeneration): PendingCandidate {
-  let rejectPromise: ((error: unknown) => void) | undefined;
-  let resolvePromise: ((candidate: DevelopmentWorkerCandidate) => void) | undefined;
-  const promise = new Promise<DevelopmentWorkerCandidate>((resolve, reject) => {
-    rejectPromise = reject;
-    resolvePromise = resolve;
-  });
+function resolveDefaultEntry(nitro: NitroCandidateHost): string {
+  return resolve(nitro.options.output.dir, nitro.options.output.serverDir, "index.mjs");
+}
 
+function createDeferred(): {
+  readonly promise: Promise<void>;
+  resolve(): void;
+} {
+  let resolvePromise: (() => void) | undefined;
+  const promise = new Promise<void>((resolveValue) => {
+    resolvePromise = resolveValue;
+  });
   return {
-    generation,
     promise,
-    reject(error) {
-      rejectPromise?.(error);
-    },
-    resolve(candidate) {
-      resolvePromise?.(candidate);
+    resolve() {
+      resolvePromise?.();
     },
   };
+}
+
+async function cleanupFailedCandidate(input: {
+  readonly candidatePromise: Promise<DevelopmentWorkerCandidate> | undefined;
+  readonly discardCandidate: (candidate: DevelopmentWorkerCandidate) => Promise<void>;
+  readonly dispose: () => Promise<void>;
+}): Promise<unknown | undefined> {
+  if (input.candidatePromise === undefined) {
+    try {
+      await input.dispose();
+      return undefined;
+    } catch (error) {
+      return error;
+    }
+  }
+
+  let candidate: DevelopmentWorkerCandidate;
+  try {
+    candidate = await input.candidatePromise;
+  } catch (error) {
+    return error;
+  }
+
+  try {
+    await input.discardCandidate(candidate);
+    return undefined;
+  } catch (error) {
+    return error;
+  }
+}
+
+async function waitForCandidateSignal(signal: Promise<void>): Promise<void> {
+  let timeout: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([
+      signal,
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => {
+          reject(new Error("Timed out waiting for Nitro to emit a worker candidate."));
+        }, NITRO_CANDIDATE_BUILD_TIMEOUT_MS);
+      }),
+    ]);
+  } finally {
+    if (timeout !== undefined) {
+      clearTimeout(timeout);
+    }
+  }
 }
