@@ -3,6 +3,7 @@ import type { RuntimeCompiledArtifactsSource } from "#runtime/compiled-artifacts
 import {
   type NitroArtifactsConfig,
   resolveNitroCompiledArtifactsSource,
+  resolveNitroRequestCompiledArtifactsSource,
 } from "#internal/nitro/routes/runtime-artifacts.js";
 import { loadCompiledManifest } from "#runtime/loaders/manifest.js";
 import { loadCompiledModuleMap } from "#runtime/loaders/module-map.js";
@@ -68,6 +69,13 @@ export function resolveAgentInfoCompiledArtifactsSource(
   input: NitroArtifactsConfig,
 ): RuntimeCompiledArtifactsSource {
   return resolveNitroCompiledArtifactsSource(input);
+}
+
+export function resolveAgentInfoRequestCompiledArtifactsSource(
+  input: NitroArtifactsConfig,
+  request: Request,
+): RuntimeCompiledArtifactsSource {
+  return resolveNitroRequestCompiledArtifactsSource(input, request);
 }
 
 async function loadAgentInfoDataFromArtifacts(

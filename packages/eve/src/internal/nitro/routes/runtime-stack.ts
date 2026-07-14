@@ -4,7 +4,7 @@ import { getCompiledRuntimeAgentBundle } from "#runtime/sessions/compiled-agent-
 import type { ResolvedChannelDefinition } from "#runtime/types.js";
 import {
   type NitroArtifactsConfig,
-  resolveNitroCompiledArtifactsSource,
+  resolveNitroRequestCompiledArtifactsSource,
 } from "#internal/nitro/routes/runtime-artifacts.js";
 
 /**
@@ -32,8 +32,9 @@ export interface NitroChannelRuntimeBundle {
  */
 export async function resolveNitroChannelRuntimeBundle(
   config: NitroArtifactsConfig,
+  request: Request,
 ): Promise<NitroChannelRuntimeBundle> {
-  const compiledArtifactsSource = resolveNitroCompiledArtifactsSource(config);
+  const compiledArtifactsSource = resolveNitroRequestCompiledArtifactsSource(config, request);
   const bundle = await getCompiledRuntimeAgentBundle({
     compiledArtifactsSource,
   });

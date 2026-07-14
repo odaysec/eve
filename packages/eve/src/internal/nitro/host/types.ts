@@ -3,6 +3,7 @@ import type { ScheduleRegistration } from "#runtime/schedules/register.js";
 import type { ResolvedScheduleDefinition } from "#runtime/types.js";
 import type { GeneratedCompiledArtifactsFiles } from "#internal/application/compiled-artifacts.js";
 import type { DevBootProgressReporter } from "#internal/dev-boot-progress.js";
+import type { DevelopmentGeneration } from "#internal/nitro/development-generation.js";
 
 /**
  * Route surface included in one programmatic Nitro host build.
@@ -69,4 +70,8 @@ export interface PreparedApplicationHost {
   scheduleRegistrations: readonly ScheduleRegistration[];
   schedules: readonly ResolvedScheduleDefinition[];
   workflowBuildDir: string;
+}
+
+export interface PreparedDevelopmentApplicationHost extends PreparedApplicationHost {
+  generation: DevelopmentGeneration;
 }

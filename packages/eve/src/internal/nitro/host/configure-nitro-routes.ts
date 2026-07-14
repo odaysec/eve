@@ -4,7 +4,6 @@ import { dirname, join, relative } from "node:path";
 import type { Nitro } from "nitro/types";
 import {
   EVE_DEV_DISPATCH_SCHEDULE_ROUTE_PATTERN,
-  EVE_DEV_RUNTIME_ARTIFACTS_ROUTE_PATH,
   EVE_HEALTH_ROUTE_PATH,
 } from "#protocol/routes.js";
 import {
@@ -316,13 +315,6 @@ function registerDevelopmentControlRoutes(
   nitro: Nitro,
   artifactsConfig: DevelopmentNitroArtifactsConfig,
 ): void {
-  addFrameworkVirtualHandler(nitro, {
-    args: JSON.stringify({ appRoot: artifactsConfig.appRoot }),
-    handlerExport: "handleDevRuntimeArtifactsRequest",
-    method: "GET",
-    modulePath: resolvePackageSourceFilePath("src/internal/nitro/routes/dev-runtime-artifacts.ts"),
-    route: EVE_DEV_RUNTIME_ARTIFACTS_ROUTE_PATH,
-  });
   addFrameworkVirtualHandler(nitro, {
     args: JSON.stringify({ appRoot: artifactsConfig.appRoot }),
     handlerExport: "handleDevScheduleDispatchRequest",

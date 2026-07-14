@@ -1,7 +1,7 @@
 import { createDevelopmentNitroArtifactsConfig } from "#internal/nitro/host/artifacts-config.js";
-import { createAuthoredSourceRuntimeCompiledArtifactsSource } from "#internal/application/runtime-compiled-artifacts-source.js";
 import { createScheduleRegistrations } from "#runtime/schedules/register.js";
 import { loadResolvedCompiledSchedules } from "#runtime/schedules/resolve-schedule.js";
+import { resolveNitroRequestCompiledArtifactsSource } from "#internal/nitro/routes/runtime-artifacts.js";
 
 /**
  * Result of dispatching one authored schedule via the dev-only HTTP route.
@@ -54,9 +54,16 @@ export class UnknownDevScheduleError extends Error {
  */
 export async function dispatchScheduleInDev(input: {
   readonly appRoot: string;
+  readonly request: Request;
   readonly scheduleId: string;
 }): Promise<DispatchScheduleInDevResult> {
-  const compiledArtifactsSource = createAuthoredSourceRuntimeCompiledArtifactsSource(input.appRoot);
+  const artifactsConfig = createDevelopmentNitroArtifactsConfig({
+    appRoot: input.appRoot,
+  });
+  const compiledArtifactsSource = resolveNitroRequestCompiledArtifactsSource(
+    artifactsConfig,
+    input.request,
+  );
   const schedules = await loadResolvedCompiledSchedules({ compiledArtifactsSource });
   const registrations = createScheduleRegistrations(schedules);
   const registration = registrations.find((candidate) => candidate.scheduleId === input.scheduleId);
@@ -68,11 +75,12 @@ export async function dispatchScheduleInDev(input: {
     );
   }
 
-  const { dispatchScheduleTask } = await import("#internal/nitro/routes/schedule-task.js");
-  const artifactsConfig = createDevelopmentNitroArtifactsConfig({
-    appRoot: input.appRoot,
-  });
-  const result = await dispatchScheduleTask(registration.taskName, artifactsConfig);
+  const { dispatchScheduleTaskFromArtifacts } =
+    await import("#internal/nitro/routes/schedule-task.js");
+  const result = await dispatchScheduleTaskFromArtifacts(
+    registration.taskName,
+    compiledArtifactsSource,
+  );
 
   return {
     scheduleId: result.scheduleId,

@@ -40,6 +40,11 @@ export interface DevelopmentRuntimeArtifactsSnapshot {
   readonly sourceRoot: string;
 }
 
+export interface ActiveDevelopmentRuntimeArtifactsSnapshot {
+  readonly runtimeAppRoot: string;
+  readonly snapshotRoot: string;
+}
+
 /**
  * Resolves the dev-server pointer that records the latest runtime artifact
  * snapshot for new sessions.
@@ -136,6 +141,21 @@ export function readDevelopmentRuntimeArtifactsSnapshotRoot(
   }
 
   return pointer.runtimeAppRoot;
+}
+
+export function readActiveDevelopmentRuntimeArtifactsSnapshot(
+  appRoot: string,
+): ActiveDevelopmentRuntimeArtifactsSnapshot | undefined {
+  const pointer = readDevelopmentRuntimeArtifactsPointer(
+    resolveDevelopmentRuntimeArtifactsPointerPath(appRoot),
+  );
+  if (pointer === undefined || pointer.version === 1) {
+    return undefined;
+  }
+  return {
+    runtimeAppRoot: pointer.runtimeAppRoot,
+    snapshotRoot: pointer.snapshotRoot,
+  };
 }
 
 /**

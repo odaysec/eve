@@ -5,7 +5,7 @@ import {
   toCrossChannelTargets,
 } from "#channel/cross-channel-receive.js";
 import type { DeliverInput, RunInput, Runtime } from "#channel/types.js";
-import type { RouteHandlerArgs, WebSocketRouteHooks } from "#channel/routes.js";
+import type { RouteHandlerArgs, WebSocketPeer, WebSocketRouteHooks } from "#channel/routes.js";
 import { createSendFn } from "#channel/send.js";
 import { createGetSessionFn } from "#channel/session.js";
 import { createLogger, logError } from "#internal/logging.js";
@@ -14,6 +14,10 @@ import type { NitroArtifactsConfig } from "#internal/nitro/routes/runtime-artifa
 import { resolveNitroChannelRuntimeBundle } from "#internal/nitro/routes/runtime-stack.js";
 import { readVercelProjectLink } from "#internal/vercel/project-link.js";
 import { withVercelOidcProjectResolver } from "#runtime/governance/auth/vercel-oidc-project.js";
+import {
+  DEVELOPMENT_WORKER_METADATA_HEADER,
+  readDevelopmentWorkerRequestMetadata,
+} from "#internal/nitro/host/dev-worker-metadata.js";
 
 const log = createLogger("channel.dispatch");
 
@@ -45,7 +49,7 @@ export async function dispatchChannelRequest(
   routeKey: string,
   config: NitroArtifactsConfig,
 ): Promise<Response> {
-  const bundle = await resolveNitroChannelRuntimeBundle(config);
+  const bundle = await resolveNitroChannelRuntimeBundle(config, event.req);
 
   const matchedChannel = bundle.channels.find(
     (channel) => `${channel.method.toUpperCase()} ${channel.urlPath}` === routeKey,
@@ -100,7 +104,7 @@ export async function dispatchChannelWebSocketRequest(
   routeKey: string,
   config: NitroArtifactsConfig,
 ): Promise<WebSocketRouteHooks> {
-  const bundle = await resolveNitroChannelRuntimeBundle(config);
+  const bundle = await resolveNitroChannelRuntimeBundle(config, event.req);
 
   const matchedChannel = bundle.channels.find(
     (channel) => `${channel.method.toUpperCase()} ${channel.urlPath}` === routeKey,
@@ -123,7 +127,7 @@ export async function dispatchChannelWebSocketRequest(
       async () => await websocket(event.req, routeArgs.args),
     );
     flushBackgroundTasks(event, routeArgs.backgroundTasks, routeKey, matchedChannel.name);
-    return hooks;
+    return protectWebSocketPeerMetadata(hooks, routeArgs.args.requestIp);
   } catch (error) {
     const errorId = logError(log, "channel websocket handler threw", error, {
       routeKey,
@@ -198,8 +202,8 @@ function buildRouteArgs(
       requestIp,
     },
     async () => {
-      const { handleAgentInfoRequest } = await import("#internal/nitro/routes/info.js");
-      return await handleAgentInfoRequest(config);
+      const { handleAgentInfoRequestForRequest } = await import("#internal/nitro/routes/info.js");
+      return await handleAgentInfoRequestForRequest(config, event.req);
     },
   );
 
@@ -271,6 +275,71 @@ function flushBackgroundTasks(
 }
 
 function extractSocketIp(event: H3Event): string | null {
+  const trustedAddress = readDevelopmentWorkerRequestMetadata(event.req)?.clientAddress;
+  if (trustedAddress !== undefined) {
+    return trustedAddress;
+  }
+
   const ip = event.req.ip;
   return typeof ip === "string" && ip.length > 0 ? ip : null;
+}
+
+function protectWebSocketPeerMetadata(
+  hooks: WebSocketRouteHooks,
+  requestIp: string | null,
+): WebSocketRouteHooks {
+  const peers = new WeakMap<WebSocketPeer, WebSocketPeer>();
+  const wrap = (peer: WebSocketPeer): WebSocketPeer => {
+    const existing = peers.get(peer);
+    if (existing !== undefined) {
+      return existing;
+    }
+
+    const requestHeaders = new Headers(peer.request.headers);
+    requestHeaders.delete(DEVELOPMENT_WORKER_METADATA_HEADER);
+    const publicRequest = new Proxy(peer.request, {
+      get(target, property) {
+        if (property === "headers") {
+          return requestHeaders;
+        }
+        const value = Reflect.get(target, property, target) as unknown;
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const wrapped = new Proxy(peer, {
+      get(target, property) {
+        if (property === "remoteAddress") {
+          return requestIp ?? undefined;
+        }
+        if (property === "request") {
+          return publicRequest;
+        }
+        const value = Reflect.get(target, property, target) as unknown;
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    peers.set(peer, wrapped);
+    return wrapped;
+  };
+  const preserved: WebSocketRouteHooks = {};
+  if (hooks.close !== undefined) {
+    const close = hooks.close;
+    preserved.close = async (peer, details) => await close(wrap(peer), details);
+  }
+  if (hooks.error !== undefined) {
+    const error = hooks.error;
+    preserved.error = async (peer, cause) => await error(wrap(peer), cause);
+  }
+  if (hooks.message !== undefined) {
+    const message = hooks.message;
+    preserved.message = async (peer, value) => await message(wrap(peer), value);
+  }
+  if (hooks.open !== undefined) {
+    const open = hooks.open;
+    preserved.open = async (peer) => await open(wrap(peer));
+  }
+  if (hooks.upgrade !== undefined) {
+    preserved.upgrade = hooks.upgrade;
+  }
+  return preserved;
 }

@@ -753,6 +753,10 @@ export async function createDevelopmentApplicationNitro(
 ): Promise<Nitro> {
   const nitroBuildDir = resolveNitroBuildDirectory(preparedHost.appRoot);
   const bundler = createApplicationNitroBundlerConfiguration(preparedHost, undefined);
+  const plugins = createApplicationNitroPlugins(preparedHost);
+  plugins.push(
+    resolvePackageSourceFilePath("src/internal/nitro/host/dev-worker-metadata-plugin.ts"),
+  );
 
   await prepareEveVersionedCacheDirectory(nitroBuildDir);
   const nitro = await createNitro(
@@ -762,7 +766,7 @@ export async function createDevelopmentApplicationNitro(
       dev: true,
       features: { websocket: true },
       logLevel: 1,
-      plugins: createApplicationNitroPlugins(preparedHost),
+      plugins,
       publicAssets: [],
       scanDirs: [resolvePackageSourceDirectoryPath("src/execution")],
       rolldownConfig: bundler.nitroRolldownConfig,

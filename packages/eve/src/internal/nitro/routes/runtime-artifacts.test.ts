@@ -3,7 +3,11 @@ import { describe, expect, it } from "vitest";
 import { COMPILED_AGENT_MANIFEST_VERSION } from "#compiler/manifest.js";
 import { installBundledCompiledArtifacts } from "#runtime/loaders/bundled-artifacts.js";
 import { createRuntimeSession, withRuntimeSession } from "#runtime/sessions/runtime-session.js";
-import { resolveNitroCompiledArtifactsSource } from "#internal/nitro/routes/runtime-artifacts.js";
+import {
+  resolveNitroCompiledArtifactsSource,
+  resolveNitroRequestCompiledArtifactsSource,
+} from "#internal/nitro/routes/runtime-artifacts.js";
+import { installDevelopmentWorkerRequestMetadata } from "#internal/nitro/host/dev-worker-metadata.js";
 
 /**
  * Installs an empty compiled-artifact snapshot on the currently active runtime
@@ -82,6 +86,45 @@ describe("resolveNitroCompiledArtifactsSource", () => {
         sandboxAppRoot: "/tmp/dev-app",
       });
     });
+  });
+
+  it("resolves a development request from its admitted generation", () => {
+    const request = new Request("http://worker.test/");
+    installDevelopmentWorkerRequestMetadata(request, {
+      clientAddress: "192.0.2.10",
+      generationId: "generation-a",
+      runtimeAppRoot: "/tmp/dev-app/.eve/dev-runtime/snapshots/generation-a/source/app",
+    });
+
+    expect(
+      resolveNitroRequestCompiledArtifactsSource(
+        {
+          appRoot: "/tmp/dev-app",
+          devRuntimeArtifactsPointerPath: "/tmp/dev-app/.eve/dev-runtime/current.json",
+          kind: "development",
+          moduleMapLoaderPath: "/package/src/internal/authored-module-map-loader.ts",
+        },
+        request,
+      ),
+    ).toMatchObject({
+      appRoot: "/tmp/dev-app/.eve/dev-runtime/snapshots/generation-a/source/app",
+      kind: "disk",
+      sandboxAppRoot: "/tmp/dev-app",
+    });
+  });
+
+  it("rejects a development request without an admitted generation", () => {
+    expect(() =>
+      resolveNitroRequestCompiledArtifactsSource(
+        {
+          appRoot: "/tmp/dev-app",
+          devRuntimeArtifactsPointerPath: "/tmp/dev-app/.eve/dev-runtime/current.json",
+          kind: "development",
+          moduleMapLoaderPath: "/package/src/internal/authored-module-map-loader.ts",
+        },
+        new Request("http://worker.test/"),
+      ),
+    ).toThrow("missing its admitted artifact generation");
   });
 
   it("uses bundled artifacts outside development mode when they exist", async () => {

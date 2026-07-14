@@ -26,7 +26,10 @@ import {
   discardDevelopmentGeneration,
   stageDevelopmentGeneration,
 } from "#internal/nitro/development-generation.js";
-import type { PreparedApplicationHost } from "#internal/nitro/host/types.js";
+import type {
+  PreparedApplicationHost,
+  PreparedDevelopmentApplicationHost,
+} from "#internal/nitro/host/types.js";
 
 /**
  * Compiles one authored app in place and stages the package-owned artifacts
@@ -35,7 +38,7 @@ import type { PreparedApplicationHost } from "#internal/nitro/host/types.js";
  */
 export async function prepareDevelopmentApplicationHost(
   startPath: string,
-): Promise<PreparedApplicationHost> {
+): Promise<PreparedDevelopmentApplicationHost> {
   const compileResult = await compileAgent({
     startPath,
   });
@@ -56,12 +59,15 @@ export async function prepareDevelopmentApplicationHost(
       appRoot: compileResult.project.appRoot,
       generation,
     });
-    return createPreparedApplicationHost({
-      compileResult,
-      compiledArtifacts,
-      schedules,
-      workflowBuildDir: resolveWorkflowBuildDirectory(compileResult.project.appRoot),
-    });
+    return {
+      ...createPreparedApplicationHost({
+        compileResult,
+        compiledArtifacts,
+        schedules,
+        workflowBuildDir: resolveWorkflowBuildDirectory(compileResult.project.appRoot),
+      }),
+      generation,
+    };
   } catch (error) {
     await discardDevelopmentGeneration(generation);
     throw error;

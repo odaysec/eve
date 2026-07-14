@@ -28,11 +28,40 @@ const scenarioApp = useScenarioApp();
 const DEV_SERVER_SCENARIO_TIMEOUT_MS = 360_000;
 const DEV_SERVER_AGENT_DESCRIPTOR: ScenarioAppDescriptor = {
   ...WEATHER_AGENT_DESCRIPTOR,
-  files: Object.fromEntries(
-    Object.entries(WEATHER_AGENT_DESCRIPTOR.files).filter(
-      ([path]) => !path.startsWith("agent/channels/"),
+  files: {
+    ...Object.fromEntries(
+      Object.entries(WEATHER_AGENT_DESCRIPTOR.files).filter(
+        ([path]) => !path.startsWith("agent/channels/"),
+      ),
     ),
-  ),
+    "agent/channels/dev-generation.ts": [
+      'import { defineChannel, GET } from "eve/channels";',
+      "",
+      "export default defineChannel({",
+      '  routes: [GET("/dev-generation", () => new Response(process.env.EVE_SCENARIO_RELOAD ?? process.env.EVE_WEBSOCKET_RELOAD ?? "initial"))],',
+      "});",
+      "",
+    ].join("\n"),
+  },
+};
+const WEBSOCKET_DEV_SERVER_DESCRIPTOR: ScenarioAppDescriptor = {
+  ...DEV_SERVER_AGENT_DESCRIPTOR,
+  files: {
+    ...DEV_SERVER_AGENT_DESCRIPTOR.files,
+    "agent/channels/socket.ts": [
+      'import { defineChannel, WS } from "eve/channels";',
+      "",
+      "export default defineChannel({",
+      '  routes: [WS("/socket", () => ({',
+      "    message(peer, message) {",
+      '      const transportHeader = peer.request.headers.has("x-eve-dev-worker-metadata") ? "exposed" : "hidden";',
+      '      peer.send(`${transportHeader}:${peer.remoteAddress ?? "missing"}:${message.text()}`);',
+      "    },",
+      "  }))],",
+      "});",
+      "",
+    ].join("\n"),
+  },
 };
 
 interface RunningEveDev {
@@ -63,10 +92,12 @@ function hasUnsupportedWindowsEsmImport(text: string): boolean {
   );
 }
 
-function hasKnownDevBundlingFailure(text: string): boolean {
+function hasKnownDevServerFailure(text: string): boolean {
   return (
     hasUnsupportedWindowsEsmImport(text) ||
     text.includes("UNRESOLVED_IMPORT") ||
+    text.includes("ECONNRESET") ||
+    text.includes("socket hang up") ||
     (text.includes("ERR_MODULE_NOT_FOUND") && text.includes("authored-module-map-loader"))
   );
 }
@@ -84,13 +115,13 @@ async function wait(ms: number): Promise<void> {
 }
 
 async function waitForCondition(
-  condition: () => boolean,
+  condition: () => boolean | Promise<boolean>,
   failureMessage: string,
   timeoutMs: number = 60_000,
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
 
-  while (!condition()) {
+  while (!(await condition())) {
     if (Date.now() >= deadline) {
       throw new Error(failureMessage);
     }
@@ -152,11 +183,11 @@ async function waitForServerUrl(input: {
       const output = input.getOutput();
       const combinedOutput = `${output.stdout}\n${output.stderr}`;
 
-      if (hasKnownDevBundlingFailure(combinedOutput)) {
+      if (hasKnownDevServerFailure(combinedOutput)) {
         settleReject(
           new Error(
             [
-              "eve dev emitted a known generated dev bundle import failure.",
+              "eve dev emitted a known reload or generated-bundle failure.",
               `stdout:\n${output.stdout}`,
               `stderr:\n${output.stderr}`,
             ].join("\n\n"),
@@ -191,6 +222,46 @@ async function waitForServerUrl(input: {
     input.child.once("error", settleReject);
     input.child.once("exit", handleExit);
     handleOutput();
+  });
+}
+
+async function waitForWebSocketOpen(socket: WebSocket): Promise<void> {
+  await waitForWebSocketEvent(socket, "open", () => undefined);
+}
+
+async function waitForWebSocketMessage(socket: WebSocket): Promise<string> {
+  return await waitForWebSocketEvent(socket, "message", (event) => String(event.data));
+}
+
+async function waitForWebSocketClose(socket: WebSocket): Promise<void> {
+  await waitForWebSocketEvent(socket, "close", () => undefined);
+}
+
+async function waitForWebSocketEvent<T>(
+  socket: WebSocket,
+  eventName: "close" | "message" | "open",
+  select: (event: MessageEvent) => T,
+): Promise<T> {
+  return await new Promise<T>((resolve, reject) => {
+    const deadline = setTimeout(() => {
+      cleanup();
+      reject(new Error(`Timed out waiting for WebSocket ${eventName}.`));
+    }, 10_000);
+    const cleanup = () => {
+      clearTimeout(deadline);
+      socket.removeEventListener(eventName, onEvent as EventListener);
+      socket.removeEventListener("error", onError);
+    };
+    const onEvent = (event: Event) => {
+      cleanup();
+      resolve(select(event as MessageEvent));
+    };
+    const onError = () => {
+      cleanup();
+      reject(new Error(`WebSocket failed while waiting for ${eventName}.`));
+    };
+    socket.addEventListener(eventName, onEvent as EventListener, { once: true });
+    socket.addEventListener("error", onError, { once: true });
   });
 }
 
@@ -257,6 +328,42 @@ async function startEveDev(appRoot: string): Promise<RunningEveDev> {
 
 describe("eve dev server", () => {
   it(
+    "keeps an admitted websocket on its worker while a ready replacement is promoted",
+    async () => {
+      const app = await scenarioApp(WEBSOCKET_DEV_SERVER_DESCRIPTOR);
+      const server = await startEveDev(app.appRoot);
+      const socketUrl = new URL("/socket", server.url);
+      socketUrl.protocol = "ws:";
+      const socket = new WebSocket(socketUrl);
+
+      try {
+        await waitForWebSocketOpen(socket);
+        const firstMessage = waitForWebSocketMessage(socket);
+        socket.send("before");
+        await expect(firstMessage).resolves.toBe("hidden:127.0.0.1:before");
+
+        await writeFile(join(app.appRoot, ".env.local"), "EVE_WEBSOCKET_RELOAD=1\n");
+        await waitForCondition(async () => {
+          const generation = await fetch(new URL("/dev-generation", server.url));
+          return (await generation.text()) === "1";
+        }, `Timed out waiting for websocket worker replacement.\n\nstdout:\n${server.stdout()}\n\nstderr:\n${server.stderr()}`);
+
+        const nextMessage = waitForWebSocketMessage(socket);
+        socket.send("after");
+        await expect(nextMessage).resolves.toBe("hidden:127.0.0.1:after");
+      } finally {
+        if (socket.readyState === WebSocket.OPEN) {
+          const closed = waitForWebSocketClose(socket);
+          socket.close();
+          await closed;
+        }
+        await server.stop();
+      }
+    },
+    DEV_SERVER_SCENARIO_TIMEOUT_MS,
+  );
+
+  it(
     "rebuilds after its startup runtime generation is force-pruned and completes a streamed turn",
     async () => {
       const app = await scenarioApp(DEV_SERVER_AGENT_DESCRIPTOR);
@@ -312,8 +419,10 @@ describe("eve dev server", () => {
           const currentRuntimeRoot = readDevelopmentRuntimeArtifactsSnapshotRoot(pointerPath);
           return currentRuntimeRoot !== undefined && currentRuntimeRoot !== authoredRuntimeRoot;
         }, `Timed out waiting for the structural reload snapshot.\n\nstdout:\n${server.stdout()}\n\nstderr:\n${server.stderr()}`);
-        // Nitro exposes no replacement-ready signal while it owns the public listener.
-        await wait(2_000);
+        await waitForCondition(async () => {
+          const generation = await fetch(new URL("/dev-generation", server.url));
+          return (await generation.text()) === "1";
+        }, `Timed out waiting for a ready replacement worker.\n\nstdout:\n${server.stdout()}\n\nstderr:\n${server.stderr()}`);
         let messageResult: Awaited<ReturnType<typeof sendDevelopmentMessage>>;
         try {
           messageResult = await sendDevelopmentMessage({
@@ -342,7 +451,7 @@ describe("eve dev server", () => {
           ].join("\n\n"),
         ).toBe(true);
         const output = `${server.stdout()}\n${server.stderr()}`;
-        expect(hasKnownDevBundlingFailure(output)).toBe(false);
+        expect(hasKnownDevServerFailure(output)).toBe(false);
       } finally {
         await server.stop();
       }

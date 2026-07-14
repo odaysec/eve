@@ -2,7 +2,7 @@ import type { H3Event } from "nitro";
 import { describe, expect, it, vi } from "vitest";
 
 import { CHANNEL_SENTINEL, type CompiledChannel } from "#channel/compiled-channel.js";
-import type { RouteHandlerArgs } from "#channel/routes.js";
+import type { RouteHandlerArgs, WebSocketPeer } from "#channel/routes.js";
 import type { DeliverInput, RunInput, Runtime } from "#channel/types.js";
 import { readVercelProjectLink } from "#internal/vercel/project-link.js";
 import type { RouteContext } from "#public/definitions/channel.js";
@@ -13,6 +13,7 @@ import {
   dispatchChannelWebSocketRequest,
 } from "#internal/nitro/routes/channel-dispatch.js";
 import { resolveNitroChannelRuntimeBundle } from "#internal/nitro/routes/runtime-stack.js";
+import { installDevelopmentWorkerRequestMetadata } from "#internal/nitro/host/dev-worker-metadata.js";
 
 vi.mock("#internal/nitro/routes/runtime-stack.js", () => ({
   resolveNitroChannelRuntimeBundle: vi.fn(),
@@ -50,12 +51,20 @@ function createDeferred<T>() {
 function createEvent(input?: {
   readonly headers?: Record<string, string>;
   readonly requestIp?: string;
+  readonly trustedRequestIp?: string | null;
   readonly waitUntil?: (task: Promise<unknown>) => void;
 }): H3Event {
   const request = new Request("https://eve.test/slack", { headers: input?.headers });
   Object.assign(request, {
     ip: input?.requestIp ?? "127.0.0.1",
   });
+  if (input?.trustedRequestIp !== undefined) {
+    installDevelopmentWorkerRequestMetadata(request, {
+      clientAddress: input.trustedRequestIp,
+      generationId: "generation-a",
+      runtimeAppRoot: "/app/.eve/dev-runtime/snapshots/generation-a/source/app",
+    });
+  }
 
   return {
     context: {
@@ -275,6 +284,40 @@ describe("dispatchChannelRequest", () => {
     );
   });
 
+  it("uses the parent-captured client address instead of the worker socket address", async () => {
+    let requestIp: string | null | undefined;
+    mockedResolveNitroChannelRuntimeBundle.mockResolvedValue({
+      channels: [
+        {
+          handler: async (_request, args) => {
+            requestIp = args.requestIp;
+            return new Response("ok");
+          },
+          fetch: async () => new Response("not used"),
+          logicalPath: "agent/channels/webhook.ts",
+          method: "POST",
+          name: "webhook",
+          sourceId: "channel-webhook",
+          sourceKind: "module",
+          urlPath: "/webhook",
+        } satisfies ResolvedChannelDefinition,
+      ],
+      runtime,
+    });
+
+    await dispatchChannelRequest(
+      createEvent({
+        requestIp: "127.0.0.1",
+        trustedRequestIp: "192.0.2.80",
+        waitUntil: vi.fn(),
+      }),
+      "POST /webhook",
+      {} as never,
+    );
+
+    expect(requestIp).toBe("192.0.2.80");
+  });
+
   it("does not invent a channel request id when Vercel did not send one", async () => {
     const runtimeForTest: Runtime = {
       deliver: vi.fn().mockResolvedValue({ sessionId: "sess_route" }),
@@ -421,6 +464,61 @@ describe("dispatchChannelRequest", () => {
     expect(typeof capturedArgs?.getSession).toBe("function");
     expect(typeof capturedArgs?.receive).toBe("function");
     expect(waitUntil).toHaveBeenCalledTimes(1);
+  });
+
+  it("preserves the parent-captured client address on websocket peers", async () => {
+    let peerAddress: string | undefined;
+    let transportHeaderVisible: boolean | undefined;
+    mockedResolveNitroChannelRuntimeBundle.mockResolvedValue({
+      channels: [
+        {
+          fetch: async () => new Response("not used"),
+          websocket: async () => ({
+            open(peer) {
+              peerAddress = peer.remoteAddress;
+              transportHeaderVisible = peer.request.headers.has("x-eve-dev-worker-metadata");
+            },
+          }),
+          logicalPath: "agent/channels/voice.ts",
+          method: "WEBSOCKET",
+          name: "voice",
+          sourceId: "channel-voice",
+          sourceKind: "module",
+          urlPath: "/voice",
+        } satisfies ResolvedChannelDefinition,
+      ],
+      runtime,
+    });
+    const hooks = await dispatchChannelWebSocketRequest(
+      createEvent({
+        requestIp: "127.0.0.1",
+        trustedRequestIp: "192.0.2.90",
+        waitUntil: vi.fn(),
+      }),
+      "WEBSOCKET /voice",
+      {} as never,
+    );
+    const peer = {
+      close: vi.fn(),
+      context: {},
+      id: "peer-1",
+      namespace: "voice",
+      publish: vi.fn(),
+      remoteAddress: "127.0.0.1",
+      request: new Request("https://eve.test/voice", {
+        headers: { "x-eve-dev-worker-metadata": "signed-parent-value" },
+      }),
+      send: vi.fn(),
+      subscribe: vi.fn(),
+      terminate: vi.fn(),
+      topics: new Set<string>(),
+      unsubscribe: vi.fn(),
+    } satisfies WebSocketPeer;
+
+    await hooks.open?.(peer);
+
+    expect(peerAddress).toBe("192.0.2.90");
+    expect(transportHeaderVisible).toBe(false);
   });
 
   it("rejects websocket upgrades when no websocket channel matches", async () => {

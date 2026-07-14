@@ -1,16 +1,16 @@
-import type { IncomingMessage } from "node:http";
-import type { Socket } from "node:net";
-
 import { EVE_DEV_ENV_FLAG } from "#internal/application/optional-package-install.js";
 
-import { build as buildNitro, createDevServer, prepare } from "nitro/builder";
+import { build as buildNitro, prepare } from "nitro/builder";
 import type { Nitro } from "nitro/types";
 
 import { createDevelopmentApplicationNitro } from "#internal/nitro/host/create-application-nitro.js";
 import { createDevelopmentNitroArtifactsConfig } from "#internal/nitro/host/artifacts-config.js";
 import type { AuthoredSourceWatcherHandle } from "#internal/nitro/host/dev-authored-source-watcher.js";
 import { prepareDevelopmentApplicationHost } from "#internal/nitro/host/prepare-application-host.js";
-import { EVE_DEV_RUNTIME_ARTIFACTS_REBUILD_ROUTE_PATH } from "#protocol/routes.js";
+import {
+  EVE_DEV_RUNTIME_ARTIFACTS_REBUILD_ROUTE_PATH,
+  EVE_DEV_RUNTIME_ARTIFACTS_ROUTE_PATH,
+} from "#protocol/routes.js";
 import { resolveDiscoveryProject } from "#discover/project.js";
 import { DevelopmentServerState } from "#internal/nitro/host/dev-server-state.js";
 import { toErrorMessage } from "#shared/errors.js";
@@ -43,6 +43,10 @@ import {
 import { detectPackageManager, type PackageManagerKind } from "#setup/package-manager.js";
 import { eveDevArguments } from "#setup/primitives/index.js";
 import { devBootPhase } from "#internal/dev-boot-progress.js";
+import {
+  NitroDevelopmentWorkerServer,
+  toDevelopmentWorkerGeneration,
+} from "#internal/nitro/host/nitro-development-worker-server.js";
 
 const MAX_ALLOWED_DEVELOPMENT_SERVER_PORT = 65_535;
 const WORKFLOW_LOCAL_BASE_URL_ENV = "WORKFLOW_LOCAL_BASE_URL";
@@ -108,8 +112,7 @@ function isAddressInUseError(error: unknown): error is NodeJS.ErrnoException {
   return error instanceof Error && "code" in error && error.code === "EADDRINUSE";
 }
 
-type NitroDevelopmentServer = ReturnType<typeof createDevServer>;
-type NitroDevelopmentServerUpgrade = NitroDevelopmentServer["upgrade"];
+type NitroDevelopmentServer = NitroDevelopmentWorkerServer;
 
 function resolveDevelopmentServerPort(port: number | string | undefined): number {
   const resolvedPort =
@@ -227,73 +230,25 @@ function installWorkflowLocalQueueEnvironment(serverUrl: string): () => void {
   };
 }
 
-function attachTemporarySocketErrorHandler(socket: Socket): () => void {
-  // Keep early socket failures from becoming uncaught EventEmitter errors
-  // while Nitro/httpxy installs its own upgrade-path listeners.
-  const onSocketError = () => {};
-
-  socket.once("error", onSocketError);
-
-  return () => {
-    socket.off("error", onSocketError);
-  };
-}
-
-function shouldProxyDevelopmentServerWebSocketUpgrades(nitro: Nitro): boolean {
-  return nitro.options.features.websocket === true || nitro.options.experimental.websocket === true;
-}
-
-function guardDevelopmentServerWebSocketUpgrades(
-  nitro: Nitro,
-  devServer: NitroDevelopmentServer,
-): void {
-  const originalUpgrade = devServer.upgrade.bind(devServer) as NitroDevelopmentServerUpgrade;
-  const websocketEnabled = shouldProxyDevelopmentServerWebSocketUpgrades(nitro);
-  const guardedUpgrade: NitroDevelopmentServerUpgrade = async (
-    req: IncomingMessage,
-    socket: Socket,
-    head: unknown,
-  ) => {
-    if (!websocketEnabled) {
-      if (!socket.destroyed) {
-        socket.destroy();
-      }
-      return;
-    }
-
-    const removeSocketErrorHandler = attachTemporarySocketErrorHandler(socket);
-
-    try {
-      await originalUpgrade(req, socket, head);
-    } catch {
-      if (!socket.destroyed) {
-        socket.destroy();
-      }
-    } finally {
-      removeSocketErrorHandler();
-    }
-  };
-
-  devServer.upgrade = guardedUpgrade;
-}
-
 function addDevelopmentRuntimeArtifactsRebuildHandler(input: {
   readonly appRoot: string;
-  readonly nitro: Nitro;
+  readonly devServer: NitroDevelopmentWorkerServer;
   readonly watcher: AuthoredSourceWatcherHandle;
 }): void {
-  input.nitro.options.devHandlers.push({
-    route: EVE_DEV_RUNTIME_ARTIFACTS_REBUILD_ROUTE_PATH,
-    handler: async (event) => {
-      const requestUrl = event.node?.req.url ?? "";
-      const url = new URL(requestUrl, "http://localhost");
-      if (url.searchParams.get("force") === "1") {
-        await input.watcher.rebuild();
-      } else {
-        await input.watcher.flush();
-      }
+  input.devServer.setControlHandler(async (request) => {
+    const url = new URL(request.url);
+    if (url.pathname === EVE_DEV_RUNTIME_ARTIFACTS_ROUTE_PATH && request.method === "GET") {
       return handleDevRuntimeArtifactsRequest({ appRoot: input.appRoot });
-    },
+    }
+    if (url.pathname !== EVE_DEV_RUNTIME_ARTIFACTS_REBUILD_ROUTE_PATH || request.method !== "GET") {
+      return undefined;
+    }
+    if (url.searchParams.get("force") === "1") {
+      await input.watcher.rebuild();
+    } else {
+      await input.watcher.flush();
+    }
+    return handleDevRuntimeArtifactsRequest({ appRoot: input.appRoot });
   });
 }
 
@@ -314,12 +269,12 @@ async function closeDevelopmentServerResources(input: {
     }
   };
 
+  const devServer = input.devServer;
+  const listenerClosed = devServer === undefined ? true : await attempt(() => devServer.close());
   const authoredSourceWatcher = input.authoredSourceWatcher;
   if (authoredSourceWatcher !== undefined) {
     await attempt(() => authoredSourceWatcher.close());
   }
-  const devServer = input.devServer;
-  const listenerClosed = devServer === undefined ? true : await attempt(() => devServer.close());
   const nitro = input.nitro;
   if (nitro !== undefined) {
     await attempt(() => nitro.close());
@@ -365,7 +320,7 @@ function createDevelopmentServerStartupCleanupError(
 
 async function listenForDevelopmentServer(input: {
   readonly devServer: NitroDevelopmentServer;
-  readonly host?: string;
+  readonly host: string;
   readonly port: number | string | undefined;
   readonly retryOnAddressInUse: boolean;
 }) {
@@ -379,7 +334,6 @@ async function listenForDevelopmentServer(input: {
     const server = input.devServer.listen({
       hostname: input.host,
       port,
-      silent: true,
     });
 
     try {
@@ -476,9 +430,11 @@ async function startNitroDevelopmentServer(
       options.onBootProgress,
     );
     nitro = activeNitro;
-    devServer = createDevServer(activeNitro);
+    devServer = new NitroDevelopmentWorkerServer({
+      appRoot: preparedHost.appRoot,
+      nitro: activeNitro,
+    });
     const activeDevServer = devServer;
-    guardDevelopmentServerWebSocketUpgrades(activeNitro, devServer);
     const hostname =
       options.host ?? activeNitro.options.devServer.hostname ?? DEFAULT_DEVELOPMENT_SERVER_HOST;
     const retryOnAddressInUse = requestedPort === undefined;
@@ -503,8 +459,14 @@ async function startNitroDevelopmentServer(
     await devBootPhase(
       "building dev bundle",
       async () => {
-        await prepare(activeNitro);
-        await buildNitro(activeNitro);
+        const candidate = await activeDevServer.buildCandidate({
+          generation: toDevelopmentWorkerGeneration(preparedHost.generation),
+          trigger: async () => {
+            await prepare(activeNitro);
+            await buildNitro(activeNitro);
+          },
+        });
+        await activeDevServer.promote(candidate);
       },
       options.onBootProgress,
     );
@@ -523,7 +485,7 @@ async function startNitroDevelopmentServer(
     );
     addDevelopmentRuntimeArtifactsRebuildHandler({
       appRoot: project.appRoot,
-      nitro: activeNitro,
+      devServer: activeDevServer,
       watcher: authoredSourceWatcher,
     });
     await state.write(serverUrl);

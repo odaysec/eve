@@ -3,20 +3,40 @@ import { buildAgentInfoResponseFromManifest } from "#internal/nitro/routes/agent
 import {
   loadAgentInfoManifestData,
   resolveAgentInfoCompiledArtifactsSource,
+  resolveAgentInfoRequestCompiledArtifactsSource,
 } from "#internal/nitro/routes/agent-info/load-agent-info-data.js";
 import type { GatewayCredentialPresence } from "#internal/resolve-model-endpoint-status.js";
 import type { NitroArtifactsConfig } from "#internal/nitro/routes/runtime-artifacts.js";
+import type { RuntimeCompiledArtifactsSource } from "#runtime/compiled-artifacts-source.js";
 import type { ModelRouting } from "#shared/agent-definition.js";
 
-async function createAgentInfoPayload(input: NitroArtifactsConfig) {
+async function createAgentInfoPayload(
+  input: NitroArtifactsConfig,
+  compiledArtifactsSource: RuntimeCompiledArtifactsSource,
+) {
   const data = await loadAgentInfoManifestData({
-    compiledArtifactsSource: resolveAgentInfoCompiledArtifactsSource(input),
+    compiledArtifactsSource,
   });
 
   return buildAgentInfoResponseFromManifest(data, {
     mode: input.kind,
     gatewayCredentials: await resolveGatewayCredentialPresence(data.manifest.config.model.routing),
   });
+}
+
+async function createAgentInfoResponse(
+  input: NitroArtifactsConfig,
+  compiledArtifactsSource: RuntimeCompiledArtifactsSource,
+): Promise<Response> {
+  return new Response(
+    JSON.stringify(await createAgentInfoPayload(input, compiledArtifactsSource)),
+    {
+      headers: {
+        "cache-control": "no-store",
+        "content-type": "application/json; charset=utf-8",
+      },
+    },
+  );
 }
 
 function hasEnvValue(value: string | undefined): boolean {
@@ -49,10 +69,15 @@ async function resolveGatewayCredentialPresence(
  * Builds the package-owned JSON inspection response for the current agent.
  */
 export async function handleAgentInfoRequest(input: NitroArtifactsConfig): Promise<Response> {
-  return new Response(JSON.stringify(await createAgentInfoPayload(input)), {
-    headers: {
-      "cache-control": "no-store",
-      "content-type": "application/json; charset=utf-8",
-    },
-  });
+  return await createAgentInfoResponse(input, resolveAgentInfoCompiledArtifactsSource(input));
+}
+
+export async function handleAgentInfoRequestForRequest(
+  input: NitroArtifactsConfig,
+  request: Request,
+): Promise<Response> {
+  return await createAgentInfoResponse(
+    input,
+    resolveAgentInfoRequestCompiledArtifactsSource(input, request),
+  );
 }

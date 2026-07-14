@@ -299,28 +299,21 @@ describe("Nitro route configuration", () => {
     expect(readWriteFileSourceMatching("/workflow/steps-handler.mjs")).toBeUndefined();
   });
 
-  it("registers the dev runtime artifact revision route only in dev mode", async () => {
+  it("does not register parent-owned development control routes in Nitro", async () => {
     const devNitro = createNitroStub({ dev: true });
     const prodNitro = createNitroStub({ dev: false });
 
     await configureDevelopmentNitroRoutes(devNitro, createPreparedHost());
     await configureProductionNitroRoutes(prodNitro, createPreparedHost(), "app");
 
-    expect(devNitro.options.handlers).toContainEqual({
-      handler: "#eve-route/eve/v1/dev/runtime-artifacts",
-      method: "GET",
-      route: "/eve/v1/dev/runtime-artifacts",
-    });
-    expect(devNitro.options.handlers).not.toContainEqual(
-      expect.objectContaining({
-        route: "/eve/v1/dev/runtime-artifacts/rebuild",
-      }),
-    );
-    expect(prodNitro.options.handlers).not.toContainEqual(
-      expect.objectContaining({
-        route: "/eve/v1/dev/runtime-artifacts",
-      }),
-    );
+    for (const nitro of [devNitro, prodNitro]) {
+      expect(nitro.options.handlers).not.toContainEqual(
+        expect.objectContaining({ route: "/eve/v1/dev/runtime-artifacts" }),
+      );
+      expect(nitro.options.handlers).not.toContainEqual(
+        expect.objectContaining({ route: "/eve/v1/dev/runtime-artifacts/rebuild" }),
+      );
+    }
   });
 
   it("registers the agent info route for dev and production app builds", async () => {

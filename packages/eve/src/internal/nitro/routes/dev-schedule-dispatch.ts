@@ -53,6 +53,7 @@ export async function handleDevScheduleDispatchRequest(
   try {
     const result = await dispatchScheduleInDev({
       appRoot: input.appRoot,
+      request,
       scheduleId,
     });
     return Response.json({
